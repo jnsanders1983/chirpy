@@ -25,6 +25,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	jwtSecret      string
 }
 
 type User struct {
@@ -101,9 +102,20 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 }
 
 func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
 	var params struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
@@ -118,7 +130,7 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 
 	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   cleanChirp(params.Body),
-		UserID: params.UserID,
+		UserID: userID,
 	})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not create chirp")
@@ -235,8 +247,9 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	var params struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email            string `json:"email"`
+		Password         string `json:"password"`
+		ExpiresInSeconds *int64 `json:"expires_in_seconds"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
@@ -256,17 +269,49 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+	seconds := int64(3600)
+	if params.ExpiresInSeconds != nil {
+		seconds = *params.ExpiresInSeconds
+		if seconds < 0 {
+			respondWithError(w, http.StatusBadRequest, "Expiration cannot be negative")
+			return
+		}
+		if seconds > 3600 {
+			seconds = 3600
+		}
+	}
+
+	token, err := auth.MakeJWT(
+		user.ID,
+		cfg.jwtSecret,
+		time.Duration(seconds)*time.Second,
+	)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not create token")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, struct {
+		User
+		Token string `json:"token"`
+	}{
+		User: User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		},
+		Token: token,
 	})
 }
 
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file: ", err)
+	}
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET is not set")
 	}
 
 	dbURL := os.Getenv("DB_URL")
@@ -283,8 +328,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	apiCfg := &apiConfig{
-		db:       dbQueries,
-		platform: os.Getenv("PLATFORM"),
+		db:        dbQueries,
+		platform:  os.Getenv("PLATFORM"),
+		jwtSecret: jwtSecret,
 	}
 
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
